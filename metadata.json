@@ -1,0 +1,6 @@
+{
+  "name": "BgRemover Pro",
+  "description": "An HD AI-powered background removal tool with complete background customizer, adjustment controls, and high-fidelity canvas compositing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
