@@ -3,10 +3,12 @@ import {
   Upload, Sparkles, Download, Sliders, Image as ImageIcon, 
   Loader2, Share2, Trash2, LogOut, Lock, Mail, User, Eye, EyeOff, 
   Check, CheckCircle2, ArrowLeft, ArrowRight, ChevronRight, Plus, 
-  RefreshCw, Sun, Contrast, Folder, Layers, Grid, AlertCircle, Scissors 
+  RefreshCw, Sun, Contrast, Folder, Layers, Grid, AlertCircle, Scissors,
+  Search
 } from "lucide-react";
 // @ts-ignore
 import { removeBackground } from "https://esm.sh/@imgly/background-removal@1.4.5";
+import { ManualEraserCanvas } from "./components/ManualEraserCanvas";
 
 // Mock templates and Unsplash assets
 const BACKGROUND_TEMPLATES = [
@@ -91,6 +93,10 @@ export default function App() {
   const [processStep, setProcessStep] = useState("");
   const [savedImages, setSavedImages] = useState<SavedImage[]>([]);
   const [bgCategory, setBgCategory] = useState<"all" | "nature" | "city" | "sunset" | "beach" | "studio" | "solid">("all");
+  const [bgSearchTerm, setBgSearchTerm] = useState<string>("");
+  const [exportQuality, setExportQuality] = useState<'original' | '2k' | '3k' | '4k'>('original');
+  const [enableAISharpen, setEnableAISharpen] = useState<boolean>(true);
+  const [sharpenIntensity, setSharpenIntensity] = useState<number>(0.25);
   const [sliderPos, setSliderPos] = useState<number>(50);
   const [brightness, setBrightness] = useState<number>(100);
   const [contrast, setContrast] = useState<number>(100);
@@ -111,9 +117,11 @@ export default function App() {
   const [brushSoftness, setBrushSoftness] = useState<number>(0);
   const brushHardness = 100 - brushSoftness;
   const [brushOpacity, setBrushOpacity] = useState<number>(100);
-  const [isDrawing, setIsDrawing] = useState<boolean>(false);
-  const [undoStack, setUndoStack] = useState<string[]>([]);
-  const [redoStack, setRedoStack] = useState<string[]>([]);
+  const isDrawing = useRef<boolean>(false);
+  const prevX = useRef<number | null>(null);
+  const prevY = useRef<number | null>(null);
+  const [undoStack, setUndoStack] = useState<ImageData[]>([]);
+  const [redoStack, setRedoStack] = useState<ImageData[]>([]);
   const workingCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const originalCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const displayCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -121,6 +129,126 @@ export default function App() {
   const [cursorPos, setCursorPos] = useState({ x: 0, y: 0 });
   const [showCursor, setShowCursor] = useState<boolean>(false);
   const [editedCanvasURL, setEditedCanvasURL] = useState<string | null>(null);
+
+  // Precision Magnifier Mirror View State and Logic
+  const [showMirror, setShowMirror] = useState<boolean>(true);
+  const [mirrorMag, setMirrorMag] = useState<number>(4);
+  const mirrorCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const lastCanvasCoordsRef = useRef<{ x: number; y: number } | null>(null);
+
+  const getCanvasCoordsFromScreen = useCallback((clientX: number, clientY: number) => {
+    const canvas = workingCanvasRef.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    return {
+      x: (clientX - rect.left) * scaleX,
+      y: (clientY - rect.top) * scaleY,
+    };
+  }, []);
+
+  const drawMirror = useCallback((canvasX: number, canvasY: number) => {
+    const mainCanvas = workingCanvasRef.current;
+    const mirrorCanvas = mirrorCanvasRef.current;
+    if (!mainCanvas || !mirrorCanvas) return;
+
+    const mCtx = mirrorCanvas.getContext('2d');
+    if (!mCtx) return;
+
+    const mSize = 160;
+    mirrorCanvas.width = mSize;
+    mirrorCanvas.height = mSize;
+
+    const mag = mirrorMag;
+    const srcSize = mSize / mag;
+    const srcX = canvasX - srcSize / 2;
+    const srcY = canvasY - srcSize / 2;
+
+    mCtx.clearRect(0, 0, mSize, mSize);
+    
+    // Pixelated imaging for precise pixel borders
+    mCtx.imageSmoothingEnabled = false;
+    mCtx.drawImage(
+      mainCanvas,
+      srcX, srcY, srcSize, srcSize,
+      0, 0, mSize, mSize
+    );
+
+    // Draw target visual crosshairs
+    const half = mSize / 2;
+    mCtx.strokeStyle = '#00FFB2';
+    mCtx.lineWidth = 1.5;
+    mCtx.beginPath();
+    mCtx.moveTo(half - 12, half);
+    mCtx.lineTo(half + 12, half);
+    mCtx.moveTo(half, half - 12);
+    mCtx.lineTo(half, half + 12);
+    mCtx.stroke();
+
+    // Draw circular brush preview scaled inside the magnifier view
+    const visualRadius = (brushSize / srcSize) * (mSize / 2);
+    mCtx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+    mCtx.lineWidth = 1.5;
+    mCtx.beginPath();
+    mCtx.arc(half, half, Math.max(2, visualRadius), 0, Math.PI * 2);
+    mCtx.stroke();
+  }, [mirrorMag, brushSize]);
+
+  const handleCanvasUpdate = useCallback((x: number, y: number) => {
+    lastCanvasCoordsRef.current = { x, y };
+    drawMirror(x, y);
+  }, [drawMirror]);
+
+  // Redraw mirror whenever magnification or brush size config shifts
+  useEffect(() => {
+    if (lastCanvasCoordsRef.current) {
+      drawMirror(lastCanvasCoordsRef.current.x, lastCanvasCoordsRef.current.y);
+    }
+  }, [mirrorMag, brushSize, drawMirror]);
+
+  // Zoom / Pan coordinate offsets for manual editing
+  const [panX, setPanX] = useState<number>(0);
+  const [panY, setPanY] = useState<number>(0);
+  const [isPanning, setIsPanning] = useState<boolean>(false);
+  const [panStartX, setPanStartX] = useState<number>(0);
+  const [panStartY, setPanStartY] = useState<number>(0);
+  const [isSpacePressed, setIsSpacePressed] = useState<boolean>(false);
+
+  // Refs and synchronization hooks for event listener isolation
+  const isEraserActive = useRef<boolean>(false);
+  const activeToolRef = useRef<'select' | 'eraser' | 'restore'>('select');
+  const brushSizeRef = useRef<number>(20);
+  const brushOpacityRef = useRef<number>(100);
+  const brushSoftnessRef = useRef<number>(0);
+  const zoomRef = useRef<number>(100);
+  const isSpacePressedRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    activeToolRef.current = activeTool;
+    isEraserActive.current = (activeTool === 'eraser');
+  }, [activeTool]);
+
+  useEffect(() => {
+    brushSizeRef.current = brushSize;
+  }, [brushSize]);
+
+  useEffect(() => {
+    brushOpacityRef.current = brushOpacity;
+  }, [brushOpacity]);
+
+  useEffect(() => {
+    brushSoftnessRef.current = brushSoftness;
+  }, [brushSoftness]);
+
+  useEffect(() => {
+    zoomRef.current = zoom;
+  }, [zoom]);
+
+  useEffect(() => {
+    isSpacePressedRef.current = isSpacePressed;
+  }, [isSpacePressed]);
 
   // Subject positioning & resizing states
   const [subjectX, setSubjectX] = useState<number>(0);
@@ -250,20 +378,136 @@ export default function App() {
 
           const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
           const data = imgData.data;
+          const w = canvas.width;
+          const h = canvas.height;
 
-          // Snap alpha values according to maximum quality background removal edge snapping specs
+          // Make a fast copy of original colors to use in decontamination searches
+          const origData = new Uint8ClampedArray(data);
+
+          // We will create an alpha buffer to run subpixel antialias smoothing
+          const alphaBuffer = new Uint8Array(w * h);
           for (let i = 0; i < data.length; i += 4) {
-            const alpha = data[i + 3];
-            if (alpha < 10) {
-              data[i + 3] = 0; // fully transparent
-            } else if (alpha > 245) {
-              data[i + 3] = 255; // fully opaque
-            } else if (alpha < 128) {
-              // semi-transparent fringe — make transparent
-              data[i + 3] = 0;
-            } else {
-              // semi-transparent but mostly opaque — make solid
-              data[i + 3] = 255;
+            alphaBuffer[i / 4] = data[i + 3];
+          }
+
+          // Step 1: Detect and remove stray floating background remnants / speckles (isolated points of noise)
+          // To preserve delicate hairs, we only clean up extremely isolated points that have zero connection to major opaque blocks
+          for (let y = 2; y < h - 2; y++) {
+            for (let x = 2; x < w - 2; x++) {
+              const i = y * w + x;
+              if (alphaBuffer[i] > 0 && alphaBuffer[i] < 120) {
+                // Look in a 5x5 block around this pixel.
+                let maxNeighborAlpha = 0;
+                for (let dy = -2; dy <= 2; dy++) {
+                  for (let dx = -2; dx <= 2; dx++) {
+                    if (dx === 0 && dy === 0) continue;
+                    const neighborAlpha = alphaBuffer[(y + dy) * w + (x + dx)];
+                    if (neighborAlpha > maxNeighborAlpha) {
+                      maxNeighborAlpha = neighborAlpha;
+                    }
+                  }
+                }
+                // If the strongest neighbor is almost fully transparent, this is an isolated speckle
+                if (maxNeighborAlpha < 15) {
+                  alphaBuffer[i] = 0; // eliminate remnant noise
+                }
+              }
+            }
+          }
+
+          // Step 2: High-Quality Alpha Matting & Subpixel Anti-Blur Smoothing
+          // Run a lightweight box/bilateral hybrid smooth on the alpha channel around the transition boundaries (0 < alpha < 255)
+          const smoothedAlpha = new Uint8Array(w * h);
+          for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+              const idx = y * w + x;
+              const a = alphaBuffer[idx];
+              if (a === 0) {
+                smoothedAlpha[idx] = 0;
+              } else if (a === 255) {
+                smoothedAlpha[idx] = 255;
+              } else {
+                // transition fringe edge - apply smooth kernel
+                if (x > 0 && x < w - 1 && y > 0 && y < h - 1) {
+                  let sum = a * 4;
+                  sum += alphaBuffer[idx - 1] * 1.5;
+                  sum += alphaBuffer[idx + 1] * 1.5;
+                  sum += alphaBuffer[idx - w] * 1.5;
+                  sum += alphaBuffer[idx + w] * 1.5;
+                  sum += alphaBuffer[idx - w - 1] * 0.5;
+                  sum += alphaBuffer[idx - w + 1] * 0.5;
+                  sum += alphaBuffer[idx + w - 1] * 0.5;
+                  sum += alphaBuffer[idx + w + 1] * 0.5;
+                  
+                  const computed = Math.round(sum / 12);
+                  // Apply a light sigmoid/smoothstep transition to enhance edge quality without causing jagged aliased borders
+                  const t = computed / 255;
+                  const factor = t * t * (3 - 2 * t);
+                  smoothedAlpha[idx] = Math.round(factor * 255);
+                } else {
+                  smoothedAlpha[idx] = a;
+                }
+              }
+            }
+          }
+
+          // Update the original data array with smoothed alpha values
+          for (let i = 0; i < data.length; i += 4) {
+            data[i + 3] = smoothedAlpha[i / 4];
+          }
+
+          // Step 3: High-Fidelity Color Spill Decontamination (Anti-Halo & Spill Suppression)
+          // For transition pixels, look in a cross-pattern to find the nearest clean opaque foreground pixel.
+          // This prevents background halos (white/green/gray fringes) while perfectly preserving original colors, hair, and clothing details.
+          for (let y = 1; y < h - 1; y++) {
+            for (let x = 1; x < w - 1; x++) {
+              const idx = (y * w + x) * 4;
+              const alpha = data[idx + 3];
+              
+              if (alpha > 5 && alpha < 240) {
+                // Find a nearby solid opaque foreground pixel (alpha > 250)'s color to decontaminate
+                let refR = 0, refG = 0, refB = 0;
+                let foundOpaque = false;
+                let minDist = 999;
+                
+                // Search in expanding rings up to radius 5 for a clean opaque pixel
+                for (let r = 1; r <= 5; r++) {
+                  const searchDirs = [
+                    { dx: 0, dy: -r }, { dx: 0, dy: r },
+                    { dx: -r, dy: 0 }, { dx: r, dy: 0 },
+                    { dx: -r, dy: -r }, { dx: -r, dy: r },
+                    { dx: r, dy: -r }, { dx: r, dy: r }
+                  ];
+                  
+                  for (const dir of searchDirs) {
+                    const sx = x + dir.dx;
+                    const sy = y + dir.dy;
+                    if (sx >= 0 && sx < w && sy >= 0 && sy < h) {
+                      const sIdx = (sy * w + sx) * 4;
+                      // Check if it is a robust opaque foreground pixel
+                      if (origData[sIdx + 3] >= 253) {
+                        const dist = Math.abs(dir.dx) + Math.abs(dir.dy);
+                        if (dist < minDist) {
+                          minDist = dist;
+                          refR = origData[sIdx];
+                          refG = origData[sIdx + 1];
+                          refB = origData[sIdx + 2];
+                          foundOpaque = true;
+                        }
+                      }
+                    }
+                  }
+                  if (foundOpaque) break; // prioritizes closer rings
+                }
+
+                if (foundOpaque) {
+                  // Adaptive decontamination factor: stronger on highly transparent edge pixels
+                  const decontamStrength = (1 - (alpha / 255)) * 0.75;
+                  data[idx] = Math.round(data[idx] * (1 - decontamStrength) + refR * decontamStrength);
+                  data[idx + 1] = Math.round(data[idx + 1] * (1 - decontamStrength) + refG * decontamStrength);
+                  data[idx + 2] = Math.round(data[idx + 2] * (1 - decontamStrength) + refB * decontamStrength);
+                }
+              }
             }
           }
 
@@ -435,104 +679,67 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [bgCategory]);
 
-  // ERASER FUNCTION — erase at position (x, y):
-  const eraseAt = (canvas: HTMLCanvasElement, clientX: number, clientY: number, size: number, hardness: number, opacity: number) => {
-    const ctx = canvas.getContext('2d', { 
-      alpha: true, 
-      willReadFrequently: true 
-    });
-    if (!ctx) return;
+  // Drawing coordinate and stroke segment logic is defined inside the direct canvas event binding useEffect below.
+  const getWrapperStyle = (): React.CSSProperties => {
+    const hasCustomBg = selectedBg && selectedBg !== 'transparent';
+    const isColor = hasCustomBg && selectedBg!.startsWith('#');
     
-    // Convert display coordinates to actual canvas coordinates
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
-    const actualX = (clientX - rect.left) * scaleX;
-    const actualY = (clientY - rect.top) * scaleY;
-    const actualSize = size * scaleX;
-    
-    // Create radial gradient for soft/hard brush
-    const gradient = ctx.createRadialGradient(
-      actualX, actualY, 0,
-      actualX, actualY, actualSize / 2
-    );
-    
-    const hardRadius = (hardness / 100) * (actualSize / 2);
-    
-    gradient.addColorStop(0, `rgba(0,0,0,${opacity / 100})`);
-    gradient.addColorStop(
-      hardRadius / (actualSize / 2), 
-      `rgba(0,0,0,${opacity / 100})`
-    );
-    gradient.addColorStop(1, 'rgba(0,0,0,0)');
-    
-    // Use destination-out composite to erase pixels
-    ctx.globalCompositeOperation = 'destination-out';
-    ctx.fillStyle = gradient;
-    ctx.beginPath();
-    ctx.arc(actualX, actualY, actualSize / 2, 0, Math.PI * 2);
-    ctx.fill();
-    
-    // Reset composite operation
-    ctx.globalCompositeOperation = 'source-over';
+    let bgStyle: React.CSSProperties = {};
+    if (hasCustomBg) {
+      if (isColor) {
+        bgStyle = {
+          backgroundColor: selectedBg!,
+          backgroundImage: 'none',
+        };
+      } else {
+        bgStyle = {
+          backgroundImage: `url(${selectedBg})`,
+          backgroundSize: 'cover',
+          backgroundPosition: 'center',
+          backgroundRepeat: 'no-repeat',
+        };
+      }
+    } else {
+      bgStyle = {
+        backgroundImage: `
+          linear-gradient(45deg, #b0b0b0 25%, transparent 25%),
+          linear-gradient(-45deg, #b0b0b0 25%, transparent 25%),
+          linear-gradient(45deg, transparent 75%, #b0b0b0 75%),
+          linear-gradient(-45deg, transparent 75%, #b0b0b0 75%)
+        `,
+        backgroundSize: '16px 16px',
+        backgroundPosition: '0 0, 0 8px, 8px -8px, -8px 0px',
+        backgroundColor: '#ffffff',
+      };
+    }
+
+    return {
+      ...bgStyle,
+      position: 'relative' as const,
+      aspectRatio: origWidth && origHeight ? `${origWidth} / ${origHeight}` : '1 / 1',
+      maxWidth: '90%',
+      maxHeight: '90%',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      transform: `translate(${panX}px, ${panY}px) scale(${zoom / 100})`,
+      transformOrigin: 'center center',
+    };
   };
 
-  // RESTORE FUNCTION — paint back erased pixels at position (clientX, clientY)
-  const restoreAt = (canvas: HTMLCanvasElement, clientX: number, clientY: number, size: number, hardness: number, opacity: number) => {
-    const workCtx = canvas.getContext('2d', { alpha: true });
-    if (!workCtx || !originalCanvasRef.current) return;
-
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
-    const actualX = (clientX - rect.left) * scaleX;
-    const actualY = (clientY - rect.top) * scaleY;
-    const actualSize = size * scaleX;
-
-    const r = actualSize / 2;
-
-    // Create a small temporary canvas to draw the brush mask
-    const brushCanvas = document.createElement('canvas');
-    brushCanvas.width = actualSize;
-    brushCanvas.height = actualSize;
-    const brushCtx = brushCanvas.getContext('2d');
-    if (!brushCtx) return;
-
-    // Create radial gradient for restore opacity
-    const cx = actualSize / 2;
-    const cy = actualSize / 2;
-    const grad = brushCtx.createRadialGradient(cx, cy, 0, cx, cy, r);
-    const hardRadius = (hardness / 100) * r;
-    grad.addColorStop(0, `rgba(0,0,0,${opacity / 100})`);
-    grad.addColorStop(hardRadius / r, `rgba(0,0,0,${opacity / 100})`);
-    grad.addColorStop(1, 'rgba(0,0,0,0)');
-
-    // Draw the brush circle shape
-    brushCtx.fillStyle = grad;
-    brushCtx.beginPath();
-    brushCtx.arc(cx, cy, r, 0, Math.PI * 2);
-    brushCtx.fill();
-
-    // Now, clip/mask the original image pixels
-    brushCtx.globalCompositeOperation = 'source-in';
-    brushCtx.drawImage(
-      originalCanvasRef.current,
-      actualX - r, actualY - r, actualSize, actualSize, // source bounding box of original
-      0, 0, actualSize, actualSize                      // destination bounding box
-    );
-
-    // Finally, draw this composited feathered brush stamp onto the main working canvas!
-    workCtx.globalCompositeOperation = 'source-over';
-    workCtx.drawImage(brushCanvas, actualX - r, actualY - r);
-  };
-
-  // Undo / Redo stacks
+  // Undo / Redo stacks saving using ImageData for pixel precision and robustness
   const saveToUndoStack = () => {
     const canvas = workingCanvasRef.current;
     if (!canvas) return;
-    const snapshot = canvas.toDataURL('image/png');
-    setUndoStack(prev => [...prev.slice(-19), snapshot]);
-    setRedoStack([]);
+    const ctx = canvas.getContext('2d', { alpha: true });
+    if (!ctx) return;
+    try {
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      setUndoStack(prev => [...prev.slice(-29), imgData]);
+      setRedoStack([]);
+    } catch (e) {
+      console.error("Failed to save to undo stack:", e);
+    }
   };
 
   const handleUndo = () => {
@@ -542,20 +749,18 @@ export default function App() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     
-    // Save current to redo stack
-    setRedoStack(prev => [...prev, canvas.toDataURL('image/png')]);
-    
-    // Restore last snapshot
-    const lastSnapshot = undoStack[undoStack.length - 1];
-    setUndoStack(prev => prev.slice(0, -1));
-    
-    const img = new Image();
-    img.onload = () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.drawImage(img, 0, 0);
+    try {
+      const currentImgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      setRedoStack(prev => [...prev.slice(-29), currentImgData]);
+      
+      const lastSnapshot = undoStack[undoStack.length - 1];
+      setUndoStack(prev => prev.slice(0, -1));
+      
+      ctx.putImageData(lastSnapshot, 0, 0);
       updateEditedCanvasSnapshot();
-    };
-    img.src = lastSnapshot;
+    } catch (e) {
+      console.error("Failed to undo:", e);
+    }
   };
 
   const handleRedo = () => {
@@ -565,116 +770,149 @@ export default function App() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     
-    // Push current back to undo stack
-    setUndoStack(prev => [...prev, canvas.toDataURL('image/png')]);
+    try {
+      const currentImgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      setUndoStack(prev => [...prev.slice(-29), currentImgData]);
+      
+      const nextSnapshot = redoStack[redoStack.length - 1];
+      setRedoStack(prev => prev.slice(0, -1));
+      
+      ctx.putImageData(nextSnapshot, 0, 0);
+      updateEditedCanvasSnapshot();
+    } catch (e) {
+      console.error("Failed to redo:", e);
+    }
+  };
+
+  // Reload the original background-removed cutout back onto the canvas completely
+  const handleRestoreCanvas = () => {
+    const canvas = workingCanvasRef.current;
+    if (!canvas || !removedBgURL) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
     
-    // Pop last from redo stack
-    const nextSnapshot = redoStack[redoStack.length - 1];
-    setRedoStack(prev => prev.slice(0, -1));
+    saveToUndoStack();
     
     const img = new Image();
+    img.crossOrigin = "anonymous";
     img.onload = () => {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(img, 0, 0);
       updateEditedCanvasSnapshot();
+      showToast("Canvas restored to original cutout ✓", "success");
     };
-    img.src = nextSnapshot;
+    img.src = removedBgURL;
   };
 
   // Keyboard zoom controls helper
   const handleZoomIn = () => setZoom(prev => Math.min(400, prev + 25));
   const handleZoomOut = () => setZoom(prev => Math.max(25, prev - 25));
-  const handleZoomReset = () => setZoom(100);
+  const handleZoomReset = () => {
+    setZoom(100);
+    setPanX(0);
+    setPanY(0);
+  };
 
-  // Mouse & Touch events on the canvas
-  const handleCanvasMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (activeTool === 'select') return;
+  // Panning helper events for Workspace Container
+  const handleWorkspaceMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    const isMiddleClick = e.button === 1;
+    if (isSpacePressed || isMiddleClick) {
+      e.preventDefault();
+      setIsPanning(true);
+      setPanStartX(e.clientX - panX);
+      setPanStartY(e.clientY - panY);
+    }
+  };
+
+  const handleWorkspaceMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (isPanning) {
+      setPanX(e.clientX - panStartX);
+      setPanY(e.clientY - panStartY);
+    }
+  };
+
+  const handleWorkspaceMouseUp = () => {
+    if (isPanning) {
+      setIsPanning(false);
+    }
+  };
+
+  const handleWorkspaceTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (e.touches.length === 2) {
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      setTouchStartDist(dist);
+    } else if (e.touches.length === 1 && (isSpacePressed || activeTool === 'select')) {
+      setIsPanning(true);
+      setPanStartX(e.touches[0].clientX - panX);
+      setPanStartY(e.touches[0].clientY - panY);
+    }
+  };
+
+  const handleWorkspaceTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (e.touches.length === 2 && touchStartDist !== null) {
+      const dist = Math.hypot(
+        e.touches[0].clientX - e.touches[1].clientX,
+        e.touches[0].clientY - e.touches[1].clientY
+      );
+      const delta = dist - touchStartDist;
+      if (Math.abs(delta) > 5) {
+        setZoom(prev => {
+          const factor = delta > 0 ? 5 : -5;
+          return Math.max(25, Math.min(400, prev + factor));
+        });
+        setTouchStartDist(dist);
+      }
+    } else if (e.touches.length === 1 && isPanning) {
+      setPanX(e.touches[0].clientX - panStartX);
+      setPanY(e.touches[0].clientY - panStartY);
+    }
+  };
+
+  const handleWorkspaceTouchEnd = () => {
+    setTouchStartDist(null);
+    setIsPanning(false);
+  };
+
+  const handleWorkspaceWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const zoomStep = 10;
+    if (e.deltaY < 0) {
+      setZoom(prev => Math.min(400, prev + zoomStep));
+    } else {
+      setZoom(prev => Math.max(25, prev - zoomStep));
+    }
+  };
+
+  const [touchStartDist, setTouchStartDist] = useState<number | null>(null);
+
+  // Keyboard space key observer for panning and standard hotkeys
+  useEffect(() => {
+    const handleSpaceKeyDown = (e: KeyboardEvent) => {
+      if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') {
+        return;
+      }
+      if (e.key === ' ' || e.code === 'Space') {
+        e.preventDefault();
+        setIsSpacePressed(true);
+      }
+    };
     
-    const canvas = workingCanvasRef.current;
-    if (!canvas) return;
-
-    saveToUndoStack();
-    setIsDrawing(true);
-
-    if (activeTool === 'eraser') {
-      eraseAt(canvas, e.clientX, e.clientY, brushSize, brushHardness, brushOpacity);
-    } else if (activeTool === 'restore') {
-      restoreAt(canvas, e.clientX, e.clientY, brushSize, brushHardness, brushOpacity);
-    }
-  };
-
-  const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const canvas = workingCanvasRef.current;
-    if (canvas) {
-      setCursorPos({ x: e.clientX, y: e.clientY });
-      setShowCursor(true);
-    }
-
-    if (!isDrawing || activeTool === 'select' || !canvas) return;
-
-    if (activeTool === 'eraser') {
-      eraseAt(canvas, e.clientX, e.clientY, brushSize, brushHardness, brushOpacity);
-    } else if (activeTool === 'restore') {
-      restoreAt(canvas, e.clientX, e.clientY, brushSize, brushHardness, brushOpacity);
-    }
-  };
-
-  const handleCanvasMouseUp = () => {
-    if (isDrawing) {
-      setIsDrawing(false);
-      updateEditedCanvasSnapshot();
-    }
-  };
-
-  const handleCanvasMouseLeave = () => {
-    if (isDrawing) {
-      setIsDrawing(false);
-      updateEditedCanvasSnapshot();
-    }
-    setShowCursor(false);
-  };
-
-  const handleCanvasTouchStart = (e: React.TouchEvent<HTMLCanvasElement>) => {
-    if (activeTool === 'select' || !e.touches[0]) return;
+    const handleSpaceKeyUp = (e: KeyboardEvent) => {
+      if (e.key === ' ' || e.code === 'Space') {
+        setIsSpacePressed(false);
+      }
+    };
     
-    const canvas = workingCanvasRef.current;
-    if (!canvas) return;
-
-    saveToUndoStack();
-    setIsDrawing(true);
-
-    const touch = e.touches[0];
-    if (activeTool === 'eraser') {
-      eraseAt(canvas, touch.clientX, touch.clientY, brushSize, brushHardness, brushOpacity);
-    } else if (activeTool === 'restore') {
-      restoreAt(canvas, touch.clientX, touch.clientY, brushSize, brushHardness, brushOpacity);
-    }
-  };
-
-  const handleCanvasTouchMove = (e: React.TouchEvent<HTMLCanvasElement>) => {
-    if (!isDrawing || activeTool === 'select' || !e.touches[0]) return;
-    
-    const canvas = workingCanvasRef.current;
-    if (!canvas) return;
-
-    const touch = e.touches[0];
-    setCursorPos({ x: touch.clientX, y: touch.clientY });
-    setShowCursor(true);
-
-    if (activeTool === 'eraser') {
-      eraseAt(canvas, touch.clientX, touch.clientY, brushSize, brushHardness, brushOpacity);
-    } else if (activeTool === 'restore') {
-      restoreAt(canvas, touch.clientX, touch.clientY, brushSize, brushHardness, brushOpacity);
-    }
-  };
-
-  const handleCanvasTouchEnd = () => {
-    if (isDrawing) {
-      setIsDrawing(false);
-      updateEditedCanvasSnapshot();
-    }
-    setShowCursor(false);
-  };
+    window.addEventListener('keydown', handleSpaceKeyDown);
+    window.addEventListener('keyup', handleSpaceKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleSpaceKeyDown);
+      window.removeEventListener('keyup', handleSpaceKeyUp);
+    };
+  }, []);
 
   // Keyboard shortcut registry listener
   useEffect(() => {
@@ -699,8 +937,8 @@ export default function App() {
         setActiveTool('select');
         showToast("Select & compare tool active", "info");
       } else if (e.key.toLowerCase() === 'r') {
-        setActiveTool('restore');
-        showToast("Restore tool active — click & drag to paint pixels back", "info");
+        e.preventDefault();
+        handleRestoreCanvas();
       } else if (e.key === '[') {
         setBrushSize(prev => Math.max(5, prev - 5));
       } else if (e.key === ']') {
@@ -712,54 +950,15 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [undoStack, redoStack, activeTool, brushSize]);
 
-  // Handle setting canvas data on newly resolved background isolates
+  // Handle setting canvas state upon background removal loads
   useEffect(() => {
     if (!removedBgURL) {
       setEditedCanvasURL(null);
-      return;
-    }
-    
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.onload = () => {
-      const w = img.naturalWidth || img.width || 1920;
-      const h = img.naturalHeight || img.height || 1080;
-      setOrigWidth(w);
-      setOrigHeight(h);
-
-      // 1. Setup original memory canvas reference
-      if (!originalCanvasRef.current) {
-        originalCanvasRef.current = document.createElement('canvas');
-      }
-      const origCanvas = originalCanvasRef.current;
-      origCanvas.width = w;
-      origCanvas.height = h;
-      const origCtx = origCanvas.getContext('2d');
-      if (origCtx) {
-        origCtx.clearRect(0, 0, origCanvas.width, origCanvas.height);
-        origCtx.drawImage(img, 0, 0);
-      }
-
-      // 2. Setup the visible working canvas
-      const workCanvas = workingCanvasRef.current;
-      if (workCanvas) {
-        workCanvas.width = w;
-        workCanvas.height = h;
-        const workCtx = workCanvas.getContext('2d', { alpha: true });
-        if (workCtx) {
-          workCtx.imageSmoothingEnabled = true;
-          workCtx.imageSmoothingQuality = 'high';
-          workCtx.clearRect(0, 0, workCanvas.width, workCanvas.height);
-          workCtx.drawImage(img, 0, 0);
-        }
-      }
-      
-      // Seed snapshots
+    } else {
       setEditedCanvasURL(removedBgURL);
       setUndoStack([]);
       setRedoStack([]);
-    };
-    img.src = removedBgURL;
+    }
   }, [removedBgURL]);
 
   // Initialize the subject to center 70% of canvas height
@@ -1330,10 +1529,19 @@ export default function App() {
             const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
             const data = imgData.data;
 
-            // Compute high fidelity vignette edge alpha-keying
-            const cx = canvas.width / 2;
-            const cy = canvas.height / 2;
-            const maxDist = Math.sqrt(cx * cx + cy * cy) * 0.65;
+            // Smart color keying based on adaptive corner samples to safely remove background without cropping the subject
+            const corners = [
+              { x: 2, y: 2 },
+              { x: canvas.width - 3, y: 2 },
+              { x: 2, y: canvas.height - 3 },
+              { x: canvas.width - 3, y: canvas.height - 3 }
+            ];
+            
+            interface RGB { r: number; g: number; b: number; }
+            const sampleBGColors: RGB[] = corners.map(c => {
+              const baseIdx = (c.y * canvas.width + c.x) * 4;
+              return { r: data[baseIdx], g: data[baseIdx+1], b: data[baseIdx+2] };
+            });
 
             for (let y = 0; y < canvas.height; y++) {
               for (let x = 0; x < canvas.width; x++) {
@@ -1342,19 +1550,29 @@ export default function App() {
                 const g = data[idx+1];
                 const b = data[idx+2];
 
-                // Remove standard green screens or white/dark backgrounds selectively
-                const isGreen = g > r * 1.2 && g > b * 1.2;
-                const isVeryBright = r > 240 && g > 240 && b > 240;
+                // Check 1: Is green screen/chroma-key?
+                const isGreen = g > r * 1.18 && g > b * 1.18 && g > 45;
                 
-                const dx = x - cx;
-                const dy = y - cy;
-                const dist = Math.sqrt(dx * dx + dy * dy);
+                // Check 2: Is solid white/light background?
+                const isVeryBright = r > 245 && g > 245 && b > 245;
 
-                if (isGreen || isVeryBright) {
+                // Check 3: Is color extremely similar to sampled corner background colors? (With safe threshold)
+                let matchesCorner = false;
+                for (const col of sampleBGColors) {
+                  const rDiff = Math.abs(r - col.r);
+                  const gDiff = Math.abs(g - col.g);
+                  const bDiff = Math.abs(b - col.b);
+                  // Narrow threshold to safely keep subject foreground elements
+                  if (rDiff < 20 && gDiff < 20 && bDiff < 20) {
+                    matchesCorner = true;
+                    break;
+                  }
+                }
+
+                // If pixel is background, remove it; otherwise, guarantee 100% preservation (no dist-based crop)
+                if (isGreen || isVeryBright || matchesCorner) {
+                  // Do not remove subject pixels (soft fade at corners is avoided to keep 100% detail)
                   data[idx + 3] = 0;
-                } else if (dist > maxDist) {
-                  const factor = Math.max(0, 1 - (dist - maxDist) / (maxDist * 0.35));
-                  data[idx + 3] = Math.round(data[idx + 3] * factor);
                 }
               }
             }
@@ -1393,8 +1611,8 @@ export default function App() {
 
   // Run File Selection & Dimensions reading
   const handleFileChange = (file: File) => {
-    if (file.size > 15 * 1024 * 1024) {
-      showToast("File size exceeds 15MB limit.", "error");
+    if (file.size > 20 * 1024 * 1024) {
+      showToast("File size exceeds 20MB limit.", "error");
       return;
     }
     setUploadedFile(file);
@@ -1460,20 +1678,84 @@ export default function App() {
     handleSelectBg(customUrl);
   };
 
+  // Helper to compute dimensions for selected download quality
+  const getResolutionForQuality = useCallback((quality: 'original' | '2k' | '3k' | '4k') => {
+    if (quality === 'original') {
+      return { w: origWidth, h: origHeight };
+    }
+    let maxDim = 2048; // 2K Resolution (2048px) explicitly matched
+    if (quality === '3k') maxDim = 3072; // 3K Resolution (3072px) explicitly matched
+    if (quality === '4k') maxDim = 4096; // 4K Resolution (4096px) explicitly matched
+
+    const srcMax = Math.max(origWidth, origHeight);
+    if (!srcMax) return { w: maxDim, h: maxDim };
+    const ratio = maxDim / srcMax;
+    const targetW = Math.round(origWidth * ratio);
+    const targetH = Math.round(origHeight * ratio);
+    return { w: targetW, h: targetH };
+  }, [origWidth, origHeight]);
+
+  // AI-inspired pixel sharpness & detail restoration filter (high performance convolution kernel)
+  const applyDetailSharpening = (canvas: HTMLCanvasElement, intensity: number) => {
+    if (intensity <= 0) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    try {
+      const w = canvas.width;
+      const h = canvas.height;
+      const imgData = ctx.getImageData(0, 0, w, h);
+      if (!imgData) return;
+      
+      const data = imgData.data;
+      const src = new Uint8ClampedArray(data);
+      const mix = intensity;
+
+      for (let y = 1; y < h - 1; y++) {
+        const rowOffset = y * w * 4;
+        const prevRowOffset = (y - 1) * w * 4;
+        const nextRowOffset = (y + 1) * w * 4;
+
+        for (let x = 1; x < w - 1; x++) {
+          const idx = rowOffset + x * 4;
+          
+          for (let c = 0; c < 3; c++) {
+            const current = src[idx + c];
+            const left = src[idx - 4 + c];
+            const right = src[idx + 4 + c];
+            const top = src[prevRowOffset + x * 4 + c];
+            const bottom = src[nextRowOffset + x * 4 + c];
+
+            // Subtle high-pass laplacian-based detail boost
+            const sharp = current * 5 - (left + right + top + bottom);
+            const blended = current + (sharp - current) * mix;
+            
+            data[idx + c] = blended < 0 ? 0 : blended > 255 ? 255 : blended;
+          }
+          // Preserve alpha opacity channels perfectly
+        }
+      }
+      ctx.putImageData(imgData, 0, 0);
+    } catch (err) {
+      console.warn("AI detail sharpening filter skipped:", err);
+    }
+  };
+
   // Composite high-definition drawing and download
   // Composite high-definition drawing and download
   const exportImage = async (format: 'png' | 'jpg') => {
     if (!removedBgURL) return;
     setIsApplyingBg(true);
     try {
-      // Create export canvas at full original resolution
+      const { w: targetW, h: targetH } = getResolutionForQuality(exportQuality);
+
+      // Create export canvas at selected resolution
       const exportCanvas = document.createElement('canvas');
-      exportCanvas.width = origWidth;
-      exportCanvas.height = origHeight;
+      exportCanvas.width = targetW;
+      exportCanvas.height = targetH;
       const ctx = exportCanvas.getContext('2d');
       if (!ctx) return;
 
-      // Enable HD quality
+      // Enable extra high-resolution anti-blur smoothing filters
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = 'high';
 
@@ -1526,11 +1808,17 @@ export default function App() {
       // Applying Brightness and Contrast adjustments on Canvas direct manipulation
       ctx.filter = `brightness(${brightness}%) contrast(${contrast}%) ${dropShadow ? "drop-shadow(0px 20px 30px rgba(0,0,0,0.6))" : ""}`;
 
-      // Set up flip transform from center point if needed
+      // Set up flip transform from center point if needed, ensuring perfect scaling coordinates
       if (isPositionMode && selectedBg && selectedBg !== 'transparent') {
+        const scaleFactor = exportCanvas.width / origWidth;
+        const sX = subjectX * scaleFactor;
+        const sY = subjectY * scaleFactor;
+        const sW = subjectWidth * scaleFactor;
+        const sH = subjectHeight * scaleFactor;
+
         if (flipHorizontal || flipVertical) {
-          const centerX = subjectX + subjectWidth / 2;
-          const centerY = subjectY + subjectHeight / 2;
+          const centerX = sX + sW / 2;
+          const centerY = sY + sH / 2;
           ctx.translate(centerX, centerY);
           ctx.scale(flipHorizontal ? -1 : 1, flipVertical ? -1 : 1);
           ctx.translate(-centerX, -centerY);
@@ -1538,10 +1826,10 @@ export default function App() {
         
         ctx.drawImage(
           subjectImg,
-          subjectX,
-          subjectY,
-          subjectWidth,
-          subjectHeight
+          sX,
+          sY,
+          sW,
+          sH
         );
       } else {
         if (flipHorizontal || flipVertical) {
@@ -1556,8 +1844,13 @@ export default function App() {
 
       ctx.restore();
 
+      // Apply the Custom AI micro-detail enhancement filters to restore high sharpness at high resolutions
+      if (enableAISharpen) {
+        applyDetailSharpening(exportCanvas, sharpenIntensity);
+      }
+
       const timestamp = Math.floor(Date.now() / 1000);
-      const filename = `bgremover_${timestamp}.${format}`;
+      const filename = `bgremover_${exportQuality}_${timestamp}.${format}`;
       const mimeType = format === 'png' ? 'image/png' : 'image/jpeg';
       const quality = format === 'png' ? 1.0 : 0.95;
 
@@ -1571,7 +1864,7 @@ export default function App() {
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
-        showToast(`HD ${format.toUpperCase()} downloaded successfully!`, "success");
+        showToast(`Ultra-HD (${exportQuality === "original" ? "Original" : exportQuality.toUpperCase()}) ${format.toUpperCase()} downloaded successfully!`, "success");
       }, mimeType, quality);
 
     } catch (err) {
@@ -2172,7 +2465,7 @@ export default function App() {
                           <Upload className="w-6 h-6 text-[#00FFB2]" />
                         </div>
                         <h3 className="font-semibold text-[#EAEAEA] text-lg font-display tracking-wide">Drag & drop your image here</h3>
-                        <p className="text-gray-500 text-xs mt-1 font-medium">Supports JPG, PNG, WEBP — Max 15MB</p>
+                        <p className="text-gray-500 text-xs mt-1 font-medium">Supports JPG, PNG, WEBP — Max 20MB</p>
                         
                         <button className="mt-5 px-5 py-2.5 bg-[#00FFB2]/10 text-[#00FFB2] hover:bg-[#00FFB2] hover:text-slate-950 font-bold text-xs rounded-xl border border-[#00FFB2]/20 transition-all font-display uppercase tracking-wide cursor-pointer">
                           Browse Files
@@ -2268,16 +2561,9 @@ export default function App() {
                               </button>
 
                               <button
-                                onClick={() => {
-                                  setActiveTool('restore');
-                                  showToast("Restore brush active — Paint areas from original background back into view", "info");
-                                }}
-                                className={`flex items-center gap-1 px-3 py-1 text-xs font-bold rounded-xl transition-all cursor-pointer ${
-                                  activeTool === 'restore'
-                                    ? 'bg-[#00FFB2] text-slate-950 font-extrabold shadow-sm shadow-[#00FFB2]/20'
-                                    : 'text-gray-400 hover:text-white hover:bg-white/5'
-                                }`}
-                                title="Restore tool - Paint color features back from raw source (R)"
+                                onClick={handleRestoreCanvas}
+                                className="flex items-center gap-1 px-3 py-1 text-xs font-bold rounded-xl text-gray-400 hover:text-white hover:bg-white/5 transition-all cursor-pointer"
+                                title="Restore original background-removed cutout completely, clearing all manual erase strokes (R)"
                               >
                                 <span>🔄</span> Restore
                               </button>
@@ -2333,53 +2619,93 @@ export default function App() {
 
                           {/* Brush options controls nested under active brush states */}
                           {(activeTool === 'eraser' || activeTool === 'restore') && (
-                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 bg-[#05080F]/45 p-3 rounded-xl border border-[#1C2333]/60 transition-all">
-                              {/* Brush size */}
-                              <div className="space-y-0.5">
-                                <div className="flex items-center justify-between text-[11px] font-bold text-gray-400">
-                                  <span>Brush Size</span>
-                                  <span className="text-[#00FFB2] font-mono">Brush Size: {brushSize}px</span>
+                            <div className="space-y-3">
+                              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 bg-[#05080F]/45 p-3 rounded-xl border border-[#1C2333]/60 transition-all">
+                                {/* Brush size */}
+                                <div className="space-y-0.5">
+                                  <div className="flex items-center justify-between text-[11px] font-bold text-gray-400">
+                                    <span>Brush Size</span>
+                                    <span className="text-[#00FFB2] font-mono">Brush Size: {brushSize}px</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="5"
+                                    max="100"
+                                    value={brushSize}
+                                    onChange={(e) => setBrushSize(Number(e.target.value))}
+                                    className="w-full h-1 bg-[#1C2333] accent-[#00FFB2] rounded-lg cursor-pointer"
+                                  />
                                 </div>
-                                <input
-                                  type="range"
-                                  min="5"
-                                  max="100"
-                                  value={brushSize}
-                                  onChange={(e) => setBrushSize(Number(e.target.value))}
-                                  className="w-full h-1 bg-[#1C2333] accent-[#00FFB2] rounded-lg cursor-pointer"
-                                />
+
+                                {/* Softness */}
+                                <div className="space-y-0.5">
+                                  <div className="flex items-center justify-between text-[11px] font-bold text-gray-400">
+                                    <span>Brush Softness</span>
+                                    <span className="text-[#00FFB2] font-mono">Softness: {brushSoftness}%</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="0"
+                                    max="100"
+                                    value={brushSoftness}
+                                    onChange={(e) => setBrushSoftness(Number(e.target.value))}
+                                    className="w-full h-1 bg-[#1C2333] accent-[#00FFB2] rounded-lg cursor-pointer"
+                                  />
+                                </div>
+
+                                {/* Opacity */}
+                                <div className="space-y-0.5">
+                                  <div className="flex items-center justify-between text-[11px] font-bold text-gray-400">
+                                    <span>Brush Opacity</span>
+                                    <span className="text-[#00FFB2] font-mono">Opacity: {brushOpacity}%</span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="10"
+                                    max="100"
+                                    value={brushOpacity}
+                                    onChange={(e) => setBrushOpacity(Number(e.target.value))}
+                                    className="w-full h-1 bg-[#1C2333] accent-[#00FFB2] rounded-lg cursor-pointer"
+                                  />
+                                </div>
                               </div>
 
-                              {/* Softness */}
-                              <div className="space-y-0.5">
-                                <div className="flex items-center justify-between text-[11px] font-bold text-gray-400">
-                                  <span>Brush Softness</span>
-                                  <span className="text-[#00FFB2] font-mono">Softness: {brushSoftness}%</span>
+                              {/* Fine Detail Magnified Mirror Settings Row */}
+                              <div className="flex flex-col sm:flex-row items-center justify-between gap-3 bg-[#05080F]/60 p-3 rounded-xl border border-[#1C2333]/50">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-xs font-black text-[#EAEAED] tracking-wider uppercase">🔍 Precision Magnifier Mirror:</span>
+                                  <button
+                                    onClick={() => setShowMirror(!showMirror)}
+                                    className={`px-3 py-1 text-[10px] font-black uppercase tracking-wider rounded-lg border transition-all cursor-pointer ${
+                                      showMirror 
+                                        ? 'bg-[#00FFB2]/10 text-[#00FFB2] border-[#00FFB2]/30 shadow' 
+                                        : 'bg-slate-900 text-gray-400 border-[#1C2333]/80'
+                                    }`}
+                                  >
+                                    {showMirror ? '🟢 Enabled' : '🔴 Disabled'}
+                                  </button>
                                 </div>
-                                <input
-                                  type="range"
-                                  min="0"
-                                  max="100"
-                                  value={brushSoftness}
-                                  onChange={(e) => setBrushSoftness(Number(e.target.value))}
-                                  className="w-full h-1 bg-[#1C2333] accent-[#00FFB2] rounded-lg cursor-pointer"
-                                />
-                              </div>
 
-                              {/* Opacity */}
-                              <div className="space-y-0.5">
-                                <div className="flex items-center justify-between text-[11px] font-bold text-gray-400">
-                                  <span>Brush Opacity</span>
-                                  <span className="text-[#00FFB2] font-mono">Opacity: {brushOpacity}%</span>
-                                </div>
-                                <input
-                                  type="range"
-                                  min="10"
-                                  max="100"
-                                  value={brushOpacity}
-                                  onChange={(e) => setBrushOpacity(Number(e.target.value))}
-                                  className="w-full h-1 bg-[#1C2333] accent-[#00FFB2] rounded-lg cursor-pointer"
-                                />
+                                {showMirror && (
+                                  <div className="flex items-center gap-2.5">
+                                    <span className="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Mirror Zoom:</span>
+                                    <div className="flex items-center gap-1 bg-slate-950 p-0.5 rounded-lg border border-[#1C2333]">
+                                      {[2, 4, 8].map((factor) => (
+                                        <button
+                                          key={factor}
+                                          onClick={() => setMirrorMag(factor)}
+                                          className={`text-[9px] font-black px-2.5 py-1 rounded transition-all cursor-pointer ${
+                                            mirrorMag === factor 
+                                              ? 'bg-[#00FFB2] text-slate-950 shadow font-black' 
+                                              : 'text-gray-400 hover:text-white hover:bg-[#1C2333]/40'
+                                          }`}
+                                        >
+                                          {factor}X
+                                        </button>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
                               </div>
                             </div>
                           )}
@@ -2419,133 +2745,209 @@ export default function App() {
 
                         {/* If Background processed, show slider workspace or active manual brush edits */}
                         {removedBgURL ? (
-                          activeTool === 'select' ? (
-                            selectedBg && selectedBg !== 'transparent' && isPositionMode ? (
-                              <div 
-                                className="absolute inset-0 w-full h-full overflow-hidden flex items-center justify-center bg-checkerboard relative select-none animate-fade-in"
-                                id="sticker-position-workspace"
-                              >
+                          <>
+                            {/* VIEW/COMPARE WORKSPACE (Visible only when select mode is active) */}
+                            <div className={`absolute inset-0 w-full h-full ${activeTool !== 'select' ? 'hidden' : ''}`}>
+                              {selectedBg && selectedBg !== 'transparent' && isPositionMode ? (
                                 <div 
-                                  className="relative flex items-center justify-center transition-all duration-150"
-                                  style={{
-                                    width: '90%',
-                                    height: '90%',
-                                    transform: `scale(${zoom / 100})`,
-                                    transformOrigin: 'center center'
-                                  }}
+                                  className="absolute inset-0 w-full h-full overflow-hidden flex items-center justify-center bg-checkerboard relative select-none animate-fade-in"
+                                  id="sticker-position-workspace"
                                 >
-                                  {/* Layer 1: Background Canvas */}
-                                  <canvas 
-                                    ref={backgroundCanvasRef}
-                                    className="absolute max-h-full max-w-full object-contain pointer-events-none shadow-2xl"
-                                    style={{ zIndex: 1 }}
-                                  />
-                                  
-                                  {/* Layer 2: Interactive Canvas */}
-                                  <canvas 
-                                    ref={interactiveCanvasRef}
-                                    onMouseDown={handlePointerDown}
-                                    onMouseMove={handlePointerMove}
-                                    onMouseUp={handlePointerUp}
-                                    onMouseLeave={handlePointerUp}
-                                    onTouchStart={handlePointerDown}
-                                    onTouchMove={handlePointerMove}
-                                    onTouchEnd={handlePointerUp}
-                                    className="absolute max-h-full max-w-full object-contain shadow-2xl cursor-grab active:cursor-grabbing transition-shadow duration-150"
-                                    style={{ zIndex: 2, background: 'transparent' }}
-                                  />
-                                </div>
-
-                                <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-[#05080F]/95 border border-[#00FFB2]/30 text-[#00FFB2] text-[10px] font-black tracking-widest uppercase px-4 py-2 rounded-full shadow-2xl z-20 flex items-center gap-1.5 backdrop-blur-md">
-                                  <span className="w-1.5 h-1.5 bg-[#00FFB2] rounded-full animate-pulse" />
-                                  Drag subject • Resize handles • Arrow keys nudging
-                                </div>
-                              </div>
-                            ) : (
-                              <div 
-                                ref={containerRef}
-                                onMouseMove={handleMouseMove}
-                                onTouchMove={handleTouchMove}
-                                className="absolute inset-0 w-full h-full select-none cursor-ew-resize bg-[#010409] relative overflow-hidden animate-fade-in"
-                                style={{
-                                  background: selectedBg ? (selectedBg.startsWith("#") ? selectedBg : `url(${selectedBg}) center/cover no-repeat`) : undefined
-                                }}
-                              >
-                              {/* Backdrop shadow view container matching user adjustments */}
-                              <div 
-                                className="absolute inset-0 w-full h-full flex items-center justify-center"
-                                style={{
-                                  filter: `brightness(${brightness}%) contrast(${contrast}%) ${dropShadow ? "drop-shadow(0px 20px 30px rgba(0,0,0,0.60))" : ""}`
-                                }}
-                              >
-                                {/* Left Layer: Original Object representation mapped based on sliders */}
-                                <div 
-                                  className="absolute inset-y-0 left-0 overflow-hidden" 
-                                  style={{ width: `${sliderPos}%` }}
-                                >
-                                  <div className="absolute inset-0 w-full h-full flex items-center justify-center" style={{ width: containerRef.current?.getBoundingClientRect().width }}>
-                                    <img 
-                                      src={originalImageURL || ""} 
-                                      alt="Original" 
-                                      className="max-h-full max-w-full object-contain pointer-events-none" 
+                                  <div 
+                                    className="relative flex items-center justify-center transition-all duration-150"
+                                    style={{
+                                      width: '90%',
+                                      height: '90%',
+                                      transform: `scale(${zoom / 100})`,
+                                      transformOrigin: 'center center'
+                                    }}
+                                  >
+                                    {/* Layer 1: Background Canvas */}
+                                    <canvas 
+                                      ref={backgroundCanvasRef}
+                                      className="absolute max-h-full max-w-full object-contain pointer-events-none shadow-2xl"
+                                      style={{ zIndex: 1 }}
+                                    />
+                                    
+                                    {/* Layer 2: Interactive Canvas */}
+                                    <canvas 
+                                      ref={interactiveCanvasRef}
+                                      onMouseDown={handlePointerDown}
+                                      onMouseMove={handlePointerMove}
+                                      onMouseUp={handlePointerUp}
+                                      onMouseLeave={handlePointerUp}
+                                      onTouchStart={handlePointerDown}
+                                      onTouchMove={handlePointerMove}
+                                      onTouchEnd={handlePointerUp}
+                                      className="absolute max-h-full max-w-full object-contain shadow-2xl cursor-grab active:cursor-grabbing transition-shadow duration-150"
+                                      style={{ zIndex: 2, background: 'transparent' }}
                                     />
                                   </div>
-                                </div>
 
-                                {/* Right Layer: Processed Layer */}
-                                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                                  <img 
-                                    src={editedCanvasURL || removedBgURL} 
-                                    alt="Cutout Subject" 
-                                    className="max-h-full max-w-full object-contain pointer-events-none" 
-                                  />
+                                  <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-[#05080F]/95 border border-[#00FFB2]/30 text-[#00FFB2] text-[10px] font-black tracking-widest uppercase px-4 py-2 rounded-full shadow-2xl z-20 flex items-center gap-1.5 backdrop-blur-md">
+                                    <span className="w-1.5 h-1.5 bg-[#00FFB2] rounded-full animate-pulse" />
+                                    Drag subject • Resize handles • Arrow keys nudging
+                                  </div>
                                 </div>
-                              </div>
+                              ) : (
+                                <div 
+                                  ref={containerRef}
+                                  onMouseMove={handleMouseMove}
+                                  onTouchMove={handleTouchMove}
+                                  className="absolute inset-0 w-full h-full select-none cursor-ew-resize bg-[#010409] relative overflow-hidden animate-fade-in"
+                                  style={{
+                                    background: selectedBg ? (selectedBg.startsWith("#") ? selectedBg : `url(${selectedBg}) center/cover no-repeat`) : undefined
+                                  }}
+                                >
+                                  {/* Backdrop shadow view container matching user adjustments */}
+                                  <div 
+                                    className="absolute inset-0 w-full h-full flex items-center justify-center"
+                                    style={{
+                                      filter: `brightness(${brightness}%) contrast(${contrast}%) ${dropShadow ? "drop-shadow(0px 20px 30px rgba(0,0,0,0.60))" : ""}`
+                                    }}
+                                  >
+                                    {/* Left Layer: Original Object representation */}
+                                    <div 
+                                      className="absolute inset-y-0 left-0 overflow-hidden" 
+                                      style={{ width: `${sliderPos}%` }}
+                                    >
+                                      <div className="absolute inset-0 w-full h-full flex items-center justify-center" style={{ width: containerRef.current?.getBoundingClientRect().width }}>
+                                        <img 
+                                          src={originalImageURL || ""} 
+                                          alt="Original" 
+                                          className="max-h-full max-w-full object-contain pointer-events-none" 
+                                        />
+                                      </div>
+                                    </div>
 
-                              {/* Split slider handle indicator bar */}
-                              <div 
-                                className="absolute inset-y-0 w-1 bg-white flex items-center justify-center z-20 pointer-events-none"
-                                style={{ left: `${sliderPos}%` }}
-                              >
-                                <div className="w-8 h-8 rounded-full bg-white text-slate-900 border-2 border-white flex items-center justify-center shadow-2xl pointer-events-auto cursor-ew-resize">
-                                  <span className="text-[10px] font-extrabold select-none">↔</span>
+                                    {/* Right Layer: Processed Layer */}
+                                    <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                                      <img 
+                                        src={editedCanvasURL || removedBgURL} 
+                                        alt="Cutout Subject" 
+                                        className="max-h-full max-w-full object-contain pointer-events-none" 
+                                      />
+                                    </div>
+                                  </div>
+
+                                  {/* Split slider handle indicator bar */}
+                                  <div 
+                                    className="absolute inset-y-0 w-1 bg-white flex items-center justify-center z-20 pointer-events-none"
+                                    style={{ left: `${sliderPos}%` }}
+                                  >
+                                    <div className="w-8 h-8 rounded-full bg-white text-slate-900 border-2 border-white flex items-center justify-center shadow-2xl pointer-events-auto cursor-ew-resize">
+                                      <span className="text-[10px] font-extrabold select-none">↔</span>
+                                    </div>
+                                  </div>
                                 </div>
-                              </div>
+                              )}
                             </div>
-                          )) : (
-                            // DRAWING WORKSPACE (Eraser / Restore Active Canvas)
+
+                            {/* MANUAL ERASER / DRAWING WORKSPACE (Visible only when select mode is inactive) */}
                             <div 
-                              className="absolute inset-0 w-full h-full overflow-auto bg-checkerboard-eraser flex items-center justify-center p-6 select-none cursor-none animate-fade-in"
+                              onMouseDown={handleWorkspaceMouseDown}
+                              onMouseMove={handleWorkspaceMouseMove}
+                              onMouseUp={handleWorkspaceMouseUp}
+                              onTouchStart={handleWorkspaceTouchStart}
+                              onTouchMove={handleWorkspaceTouchMove}
+                              onTouchEnd={handleWorkspaceTouchEnd}
+                              onWheel={handleWorkspaceWheel}
+                              className={`absolute inset-0 w-full h-full overflow-hidden flex items-center justify-center p-6 select-none ${
+                                activeTool === 'select' ? 'hidden' : 'cursor-none'
+                              }`}
                               style={{
-                                background: selectedBg ? (selectedBg.startsWith("#") ? selectedBg : `url(${selectedBg}) center/cover no-repeat`) : undefined
+                                background: selectedBg && selectedBg !== 'transparent' ? (selectedBg.startsWith("#") ? selectedBg : `url(${selectedBg}) center/cover no-repeat`) : undefined
                               }}
                             >
                               <div 
-                                className="relative flex items-center justify-center transition-all duration-150"
-                                style={{
-                                  width: '90%',
-                                  height: '90%',
-                                  transform: `scale(${zoom / 100})`,
-                                  transformOrigin: 'center center'
-                                }}
+                                className="canvas-container shadow-2xl"
+                                style={getWrapperStyle()}
                               >
-                                <canvas 
-                                  ref={workingCanvasRef}
-                                  onMouseDown={handleCanvasMouseDown}
-                                  onMouseMove={handleCanvasMouseMove}
-                                  onMouseUp={handleCanvasMouseUp}
-                                  onMouseLeave={handleCanvasMouseLeave}
-                                  onTouchStart={handleCanvasTouchStart}
-                                  onTouchMove={handleCanvasTouchMove}
-                                  onTouchEnd={handleCanvasTouchEnd}
-                                  className="max-h-full max-w-full object-contain pointer-events-auto shadow-2xl transition-all"
-                                  style={{ 
-                                    background: 'transparent',
-                                    filter: `brightness(${brightness}%) contrast(${contrast}%) ${dropShadow ? "drop-shadow(0px 20px 30px rgba(0,0,0,0.60))" : ""}`
-                                  }}
-                                  id="manual_eraser_canvas"
+                                <ManualEraserCanvas
+                                  key={removedBgURL}
+                                  removedBgURL={removedBgURL}
+                                  activeTool={activeTool}
+                                  brushSize={brushSize}
+                                  brushSoftness={brushSoftness}
+                                  brushOpacity={brushOpacity}
+                                  zoom={zoom}
+                                  workingCanvasRef={workingCanvasRef}
+                                  originalCanvasRef={originalCanvasRef}
+                                  setOrigWidth={setOrigWidth}
+                                  setOrigHeight={setOrigHeight}
+                                  saveToUndoStack={saveToUndoStack}
+                                  updateEditedCanvasSnapshot={updateEditedCanvasSnapshot}
+                                  showCursor={showCursor}
+                                  setShowCursor={setShowCursor}
+                                  cursorPos={cursorPos}
+                                  setCursorPos={setCursorPos}
+                                  brightness={brightness}
+                                  contrast={contrast}
+                                  dropShadow={dropShadow}
+                                  isSpacePressed={isSpacePressed}
+                                  onCanvasUpdate={handleCanvasUpdate}
                                 />
                               </div>
+
+                              {/* Floating Precision Magnifier Mirror View overlay */}
+                              {showMirror && showCursor && (activeTool === 'eraser' || activeTool === 'restore') && (
+                                <div 
+                                  className="absolute top-4 right-4 bg-[#05080F]/95 border text-slate-200 border-[#00FFB2]/40 rounded-2xl p-3 shadow-2xl z-30 backdrop-blur-md w-[190px] flex flex-col items-center gap-2 animate-fade-in pointer-events-auto"
+                                >
+                                  {/* Header */}
+                                  <div className="flex items-center justify-between w-full border-b border-[#1C2333]/80 pb-1.5 px-0.5">
+                                    <span className="text-[9px] font-black tracking-widest text-[#00FFB2] uppercase">🔍 Mirror ({mirrorMag}X Zoom)</span>
+                                    <span className="text-[9px] font-mono font-black text-[#00FFB2]/70 bg-[#00FFB2]/10 px-1.5 py-0.5 rounded">Live</span>
+                                  </div>
+
+                                  {/* Canvas with checkerboard pattern */}
+                                  <div 
+                                    className="relative w-[160px] h-[160px] rounded-xl overflow-hidden border border-[#1C2333]/80 bg-slate-950 flex items-center justify-center shadow-inner"
+                                    style={{
+                                      backgroundImage: `
+                                        linear-gradient(45deg, #181f2f 25%, transparent 25%),
+                                        linear-gradient(-45deg, #181f2f 25%, transparent 25%),
+                                        linear-gradient(45deg, transparent 75%, #181f2f 75%),
+                                        linear-gradient(-45deg, transparent 75%, #181f2f 75%)
+                                      `,
+                                      backgroundSize: '12px 12px',
+                                      backgroundPosition: '0 0, 0 6px, 6px -6px, -6px 0px',
+                                      backgroundColor: '#0a0d14',
+                                    }}
+                                  >
+                                    <canvas 
+                                      ref={mirrorCanvasRef}
+                                      className="w-full h-full block"
+                                      style={{ imageRendering: 'pixelated' }}
+                                    />
+                                    {/* Crosshair visual helper overlay lines for double precision */}
+                                    <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
+                                      <div className="w-[18px] h-[1px] bg-[#00FFB2]/60 absolute" />
+                                      <div className="h-[18px] w-[1px] bg-[#00FFB2]/60 absolute" />
+                                    </div>
+                                  </div>
+
+                                  {/* Real-time Magnification Select Grid */}
+                                  <div className="flex items-center gap-1.5 w-full justify-between pt-1">
+                                    <span className="text-[9px] font-black text-gray-400 uppercase tracking-wider">Magnify:</span>
+                                    <div className="flex items-center gap-1 bg-slate-950 p-0.5 rounded-lg border border-[#1C2333]">
+                                      {[2, 4, 8].map((factor) => (
+                                        <button
+                                          key={factor}
+                                          onClick={() => setMirrorMag(factor)}
+                                          className={`text-[9px] font-extrabold px-2 py-1 rounded transition-all cursor-pointer ${
+                                            mirrorMag === factor 
+                                              ? 'bg-[#00FFB2] text-slate-950 shadow-md font-black' 
+                                              : 'text-gray-400 hover:text-white hover:bg-[#1C2333]/40'
+                                          }`}
+                                        >
+                                          {factor}x
+                                        </button>
+                                      ))}
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
 
                               {/* Floating status bar info display */}
                               <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-[#05080F]/90 border border-[#00FFB2]/30 text-[#00FFB2] text-[10px] font-black tracking-widest uppercase px-4 py-2 rounded-full shadow-2xl z-20 flex items-center gap-1.5 backdrop-blur-md">
@@ -2553,7 +2955,7 @@ export default function App() {
                                 {activeTool === 'eraser' ? '🧹 Eraser ON — drag over background to erase' : '🔁 Restore ON — drag to bring back erased areas'}
                               </div>
                             </div>
-                          )
+                          </>
                         ) : (
                           // Default original view before processed triggers
                           <div className="p-4 flex items-center justify-center h-full max-h-[400px]">
@@ -2625,12 +3027,16 @@ export default function App() {
                             <span className="text-[10px] text-[#00FFB2] uppercase font-bold tracking-wider relative">Canvas Live HD</span>
                           </div>
 
-                          {/* Category Tabs Scrollable Horizontal Row */}
+                           {/* Category Tabs Scrollable Horizontal Row */}
                           <div className="flex items-center gap-1.5 overflow-x-auto scrollbar-none pb-2 mb-3 max-w-full">
                             {(["all", "nature", "city", "sunset", "beach", "studio", "solid"] as const).map((cat) => (
                               <button
                                 key={cat}
-                                onClick={() => setBgCategory(cat)}
+                                onClick={() => {
+                                  setBgCategory(cat);
+                                  // Clear search term when clicking solid to avoid confusing empty states
+                                  if (cat === "solid" && bgSearchTerm !== "") setBgSearchTerm("");
+                                }}
                                 className={`text-[10px] uppercase tracking-wider font-extrabold whitespace-nowrap px-3.5 py-1.5 rounded-full transition-all duration-250 cursor-pointer ${
                                   bgCategory === cat 
                                     ? "bg-[#00FFB2] text-slate-950 shadow-sm shadow-[#00FFB2]/20 scale-102"
@@ -2640,6 +3046,29 @@ export default function App() {
                                 {cat}
                               </button>
                             ))}
+                          </div>
+
+                          {/* Search Input Bar */}
+                          <div className="relative mb-3 bg-slate-950 rounded-xl border border-[#1C2333] transition-all focus-within:border-[#00FFB2]/50">
+                            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400">
+                              <Search className="w-4 h-4" />
+                            </span>
+                            <input
+                              type="text"
+                              value={bgSearchTerm}
+                              onChange={(e) => setBgSearchTerm(e.target.value)}
+                              placeholder="Search backdrops (e.g., Forest, Neon, Brick, Gold)..."
+                              className="w-full bg-transparent pl-9 pr-14 py-2.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:ring-0 font-medium"
+                            />
+                            {bgSearchTerm && (
+                              <button
+                                type="button"
+                                onClick={() => setBgSearchTerm("")}
+                                className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white text-[9px] font-black uppercase tracking-wider bg-[#1C2333] px-2 py-1 rounded transition-all cursor-pointer"
+                              >
+                                Clear
+                              </button>
+                            )}
                           </div>
 
                           {/* Render Category List thumbnails */}
@@ -2656,7 +3085,9 @@ export default function App() {
                             ) : bgCategory === "solid" ? (
                               <div className="space-y-3.5 animate-fade-in pr-0.5">
                                 <div className="grid grid-cols-4 gap-2">
-                                  {PREMIUM_SOLIDS.map((color) => (
+                                  {PREMIUM_SOLIDS.filter(color => 
+                                    bgSearchTerm === "" || color.name.toLowerCase().includes(bgSearchTerm.toLowerCase())
+                                  ).map((color) => (
                                     <button
                                       key={color.hex}
                                       onClick={() => handleSelectBg(color.hex)}
@@ -2675,6 +3106,13 @@ export default function App() {
                                       </span>
                                     </button>
                                   ))}
+                                  {PREMIUM_SOLIDS.filter(color => 
+                                    bgSearchTerm === "" || color.name.toLowerCase().includes(bgSearchTerm.toLowerCase())
+                                  ).length === 0 && (
+                                    <div className="col-span-4 text-center py-8 text-gray-500 text-xs">
+                                      No solid backdrops match "{bgSearchTerm}"
+                                    </div>
+                                  )}
                                 </div>
                                 
                                 <div className="flex items-center justify-between gap-3 bg-[#090F1B] p-2.5 rounded-xl border border-[#1C2333]">
@@ -2712,49 +3150,80 @@ export default function App() {
                                   </span>
                                 </button>
 
-                                {/* List backgrounds (templates + custom uploads) */}
-                                {[
-                                  ...customBackgrounds,
-                                  ...BACKGROUND_TEMPLATES.filter(tmpl => bgCategory === "all" || tmpl.category === bgCategory)
-                                ].map((tmpl) => {
-                                  const isSelected = selectedBg === tmpl.url || selectedBg === tmpl.fullUrl;
-                                  const isFailed = failedBgURLs[tmpl.url] || failedBgURLs[tmpl.fullUrl];
-                                  return (
-                                    <button
-                                      key={tmpl.id}
-                                      onClick={() => handleSelectBg(tmpl.fullUrl || tmpl.url)}
-                                      className={`group relative flex flex-col items-center gap-1 p-0.5 rounded-xl border transition-all cursor-pointer overflow-hidden ${
-                                        isSelected
-                                          ? "border-[#00FFB2] ring-2 ring-[#00FFB2]/30 bg-[#0C121F]"
-                                          : isFailed
-                                          ? "border-red-500 ring-2 ring-red-500/20 bg-red-950/10"
-                                          : "border-[#1C2333] hover:scale-105 bg-[#0A0F1D]/45"
-                                      }`}
-                                    >
-                                      <div className="relative w-full aspect-[4/3] rounded-lg overflow-hidden bg-slate-900/45">
-                                        <img
-                                          src={tmpl.url}
-                                          alt={tmpl.name}
-                                          loading="lazy"
-                                          className="w-full h-full object-cover"
-                                          onError={() => {
-                                            setFailedBgURLs(prev => ({ ...prev, [tmpl.url]: true }));
-                                            showToast(`Failed to load backdrop: ${tmpl.name}`, "error");
-                                          }}
-                                        />
-                                        
-                                        {/* Hover Tooltip Overlay */}
-                                        <div className="absolute inset-0 bg-slate-950/85 flex items-center justify-center text-center opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none p-1">
-                                          <span className="text-[9px] text-[#00FFB2] font-extrabold uppercase tracking-wider">{tmpl.name}</span>
-                                        </div>
+                                {/* List backgrounds (templates + custom uploads + dynamic searches) */}
+                                {(() => {
+                                  const filteredBackgrounds = [
+                                    ...customBackgrounds.filter(bg => 
+                                      bgSearchTerm === "" || bg.name.toLowerCase().includes(bgSearchTerm.toLowerCase())
+                                    ),
+                                    ...BACKGROUND_TEMPLATES.filter(tmpl => {
+                                      const categoryMatches = bgCategory === "all" || tmpl.category === bgCategory;
+                                      const searchMatches = bgSearchTerm === "" || 
+                                        tmpl.name.toLowerCase().includes(bgSearchTerm.toLowerCase()) || 
+                                        tmpl.category.toLowerCase().includes(bgSearchTerm.toLowerCase());
+                                      return categoryMatches && searchMatches;
+                                    })
+                                  ];
+
+                                  // If search term is entered, offer a dynamic high-quality Unsplash Source query card in the grid!
+                                  if (bgSearchTerm.trim() !== "") {
+                                    filteredBackgrounds.push({
+                                      id: "dynamic-unsplash-search-query",
+                                      name: `Dynamic "${bgSearchTerm}"`,
+                                      url: `https://images.unsplash.com/featured/400x300/?${encodeURIComponent(bgSearchTerm)}`,
+                                      fullUrl: `https://images.unsplash.com/featured/1920x1080/?${encodeURIComponent(bgSearchTerm)}`,
+                                      category: "all" as const
+                                    });
+                                  }
+
+                                  if (filteredBackgrounds.length === 0) {
+                                    return (
+                                      <div className="col-span-3 text-center py-8 text-gray-500 text-xs bg-slate-950/20 border border-dashed border-[#1C2333]/80 rounded-xl">
+                                        No assets found for "{bgSearchTerm}"
                                       </div>
-                                      
-                                      <span className="text-[9px] text-gray-500 group-hover:text-gray-300 font-semibold truncate max-w-full text-center px-0.5">
-                                        {tmpl.category === "custom" ? "Custom" : tmpl.name}
-                                      </span>
-                                    </button>
-                                  );
-                                })}
+                                    );
+                                  }
+
+                                  return filteredBackgrounds.map((tmpl) => {
+                                    const isSelected = selectedBg === tmpl.url || selectedBg === tmpl.fullUrl;
+                                    const isFailed = failedBgURLs[tmpl.url] || failedBgURLs[tmpl.fullUrl];
+                                    return (
+                                      <button
+                                        key={tmpl.id}
+                                        onClick={() => handleSelectBg(tmpl.fullUrl || tmpl.url)}
+                                        className={`group relative flex flex-col items-center gap-1 p-0.5 rounded-xl border transition-all cursor-pointer overflow-hidden ${
+                                          isSelected
+                                            ? "border-[#00FFB2] ring-2 ring-[#00FFB2]/30 bg-[#0C121F]"
+                                            : isFailed
+                                            ? "border-red-500 ring-2 ring-red-500/20 bg-red-950/10"
+                                            : "border-[#1C2333] hover:scale-105 bg-[#0A0F1D]/45"
+                                        }`}
+                                      >
+                                        <div className="relative w-full aspect-[4/3] rounded-lg overflow-hidden bg-slate-900/45">
+                                          <img
+                                            src={tmpl.url}
+                                            alt={tmpl.name}
+                                            loading="lazy"
+                                            className="w-full h-full object-cover"
+                                            onError={() => {
+                                              setFailedBgURLs(prev => ({ ...prev, [tmpl.url]: true }));
+                                              showToast(`Failed to load backdrop: ${tmpl.name}`, "error");
+                                            }}
+                                          />
+                                          
+                                          {/* Hover Tooltip Overlay */}
+                                          <div className="absolute inset-0 bg-slate-950/85 flex items-center justify-center text-center opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none p-1">
+                                            <span className="text-[9px] text-[#00FFB2] font-extrabold uppercase tracking-wider">{tmpl.name}</span>
+                                          </div>
+                                        </div>
+                                        
+                                        <span className="text-[9px] text-gray-500 group-hover:text-gray-300 font-semibold truncate max-w-full text-center px-0.5">
+                                          {tmpl.category === "custom" ? "Custom" : tmpl.name}
+                                        </span>
+                                      </button>
+                                    );
+                                  });
+                                })()}
                               </div>
                             )}
                           </div>
@@ -3045,6 +3514,112 @@ export default function App() {
                   {removedBgURL && (
                     <div className="bg-[#0D1117] border border-[#1C2333] rounded-2xl p-6 shadow-xl space-y-4">
                       
+                      {/* Resolution Quality Custom Selection */}
+                      <div className="space-y-2.5 pb-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-bold text-gray-400 uppercase tracking-widest block font-display">
+                            Output Resolution Quality:
+                          </span>
+                          <span className="text-[10px] bg-[#00FFB2]/10 border border-[#00FFB2]/30 px-2 py-0.5 rounded text-[#00FFB2] font-black uppercase tracking-wider">
+                            Ultra Crisp Mode
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                          {(['original', '2k', '3k', '4k'] as const).map((q) => {
+                            const { w, h } = getResolutionForQuality(q);
+                            const label = q === 'original' ? 'Original' : q.toUpperCase();
+                            const isSelected = exportQuality === q;
+                            return (
+                              <button
+                                key={q}
+                                type="button"
+                                onClick={() => setExportQuality(q)}
+                                className={`flex flex-col items-center justify-center p-2 rounded-xl border text-center transition-all cursor-pointer ${
+                                  isSelected 
+                                    ? 'bg-[#00FFB2]/10 border-[#00FFB2] text-white shadow-md' 
+                                    : 'bg-[#101524]/50 border-[#1C2333] text-gray-400 hover:text-white hover:bg-[#161D2F]'
+                                }`}
+                              >
+                                <span className={`text-[11px] font-black tracking-wide uppercase ${isSelected ? 'text-[#00FFB2]' : ''}`}>
+                                  {label}
+                                </span>
+                                <span className="text-[9px] font-mono text-gray-500 font-bold mt-0.5">
+                                  {w} × {h} px
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+
+                        {/* Interactive Use-Case Suitability Preview Notification */}
+                        <div className="mt-2 p-2.5 bg-[#0A0F1D]/60 rounded-xl border border-[#1C2333] text-[11px] text-gray-400 flex items-center justify-between gap-2">
+                          <div>
+                            <span className="text-gray-300 font-bold">Preview Target: </span>
+                            {exportQuality === 'original' && <span className="text-[#00E5FF]">Original source match ({getResolutionForQuality('original').w} × {getResolutionForQuality('original').h}px)</span>}
+                            {exportQuality === '2k' && <span className="text-[#00FFB2]">2K (2048px max dim) — Ideal for Social Media & Web Use</span>}
+                            {exportQuality === '3k' && <span className="text-pink-400">3K (3072px max dim) — Perfect for Premium E-commerce Stores</span>}
+                            {exportQuality === '4k' && <span className="text-violet-400">4K Ultra HD (4096px max dim) — Print-Ready & Studio Quality</span>}
+                          </div>
+                          {!selectedBg || selectedBg === 'transparent' ? (
+                            <span className="text-[9px] text-[#00FFB2] bg-[#00FFB2]/10 border border-[#00FFB2]/20 px-1.5 py-0.5 rounded font-bold uppercase shrink-0">
+                              Transparent PNG Ok
+                            </span>
+                          ) : (
+                            <span className="text-[9px] text-amber-400 bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 rounded font-bold uppercase shrink-0">
+                              Composite Render
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* AI Super-Resolution Sharpness & Detail Upscale Tuner */}
+                      <div className="bg-[#101524]/40 border border-[#1C2333]/70 rounded-xl p-4 space-y-3">
+                        <div className="flex items-center justify-between">
+                          <label className="flex items-center gap-2 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={enableAISharpen}
+                              onChange={(e) => setEnableAISharpen(e.target.checked)}
+                              className="accent-[#00FFB2] rounded border-gray-700 bg-slate-900"
+                            />
+                            <span className="text-xs font-bold text-gray-200 uppercase tracking-wide">
+                              Enable AI Super-Resolution Sharpening
+                            </span>
+                          </label>
+                          <span className="text-[9px] bg-sky-500/10 text-sky-400 font-extrabold uppercase px-2 py-0.5 rounded font-mono border border-sky-500/20">
+                            Anti-Blur Engine
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-gray-400 leading-relaxed font-medium">
+                          Preserves original textures, micro-details, colors, and sharpness during resolution upscaling, avoiding compression loss and pixelation.
+                        </p>
+                        
+                        {enableAISharpen && (
+                          <div className="space-y-1 pt-1.5 border-t border-[#1C2333]/50">
+                            <div className="flex justify-between text-[11px] font-bold">
+                              <span className="text-gray-400">Enhancement Intensity Balance:</span>
+                              <span className="text-[#00FFB2]">{Math.round(sharpenIntensity * 100)}%</span>
+                            </div>
+                            <div className="flex items-center gap-3">
+                              <input
+                                type="range"
+                                min="0.05"
+                                max="0.5"
+                                step="0.05"
+                                value={sharpenIntensity}
+                                onChange={(e) => setSharpenIntensity(parseFloat(e.target.value))}
+                                className="w-full accent-[#00FFB2] cursor-pointer h-1.5 bg-slate-800 rounded-lg"
+                              />
+                            </div>
+                            <div className="flex justify-between text-[9px] text-gray-500 font-black uppercase">
+                              <span>Natural Detail</span>
+                              <span>Balanced Crisp</span>
+                              <span>Maximum Studio Sharp</span>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
                       <div className="grid grid-cols-2 gap-3">
                         <button 
                           onClick={() => exportImage('png')}
@@ -3063,11 +3638,12 @@ export default function App() {
 
                       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between border-t border-[#1C2333]/30 pt-3.5 text-[11px] text-gray-400 font-bold tracking-wider gap-2">
                         <div className="flex flex-wrap items-center gap-3">
-                          <span>Resolution: <span className="text-gray-300 font-mono">{fileDetails.dimensions}</span></span>
-                          <span>Format: <span className="text-gray-300">PNG — Lossless</span></span>
+                          <span>Target Quality: <span className="text-[#00FFB2] font-mono uppercase font-black">{exportQuality === 'original' ? 'Original size' : exportQuality.toUpperCase()}</span></span>
+                          <span>Dimensions: <span className="text-gray-300 font-mono">{getResolutionForQuality(exportQuality).w} × {getResolutionForQuality(exportQuality).h} px</span></span>
+                          <span>Format: <span className="text-gray-300">PNG / JPG</span></span>
                         </div>
                         <span className="text-[#00FFB2] font-black uppercase tracking-widest flex items-center gap-1">
-                          ✓ HD Quality
+                          ✓ Anti-Blur Resampling
                         </span>
                       </div>
                     </div>
